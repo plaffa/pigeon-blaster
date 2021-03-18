@@ -5,6 +5,7 @@ import cv2
 from threading import Thread
 import pigpio
 import time
+import random
 
 
 class VideoStream:
@@ -47,11 +48,56 @@ class VideoStream:
 	# Indicate that the camera and thread should be stopped
         self.stopped = True
 
-"""
-class PigeonWaterBlaster(object):
+
+class BlasterAssembly(object):
     def __init__(self,
-                 ):
-                 """
+                 pan_pin, tilt_pin,
+                 pump_pin,
+                 imh, imw):
+    
+        self.video_stream = VideoStream(resolution=(self.imh, self.imw),framerate=10)
+        self.gun = Gun(pump_pin)
+        self.pan_tilt = PanTilt(pan_pin, tilt_pin, pump_pin)
+    
+    def start(self):
+        self.gun.start()
+        self.pan_tilt.start()
+    
+    def eliminate_target(self, y, x, coordinate_system='image'):
+        self.aim_gun_at(y, x, coordinate_system)
+        self.fire()
+        
+    def aim_gun_at(self, y, x, coordinate_system):
+        self.pan_tilt.aim_at(y, x, coordinate_system)
+        
+    def fire(self):
+        self.gun.fire()
+        
+
+class Gun(object):
+    def __init__(self, gun_pin, fire_duration=1):
+        
+        self.firing = False
+        self.fire_duration = fire_duration
+        
+        self.gun_pin = gun_pin
+        self.gun = pigpio.pi()
+    
+    def start(self):
+        Thread(target=self.fire_control, args=()).start()
+    
+    def fire_control(self):
+        while True:
+            if self.firing:
+                self.gun.write(self.gun_pin, 1)
+                time.sleep(self.fire_duration/2)
+                self.gun.write(self.gun_pin, 0)
+                time.sleep(self.fire_duration/2)
+                self.firing = False
+        
+    def fire(self):
+        self.firing = True
+                 
 
 class PanTilt(object):
     def __init__(self,
@@ -93,24 +139,41 @@ class PanTilt(object):
         self.tilt_position = (servo_max - servo_min) / 2
 
         self.calibrated = True
-        self.video_stream = VideoStream(resolution=(500, 500),framerate=10)
+        self.video_stream = VideoStream(resolution=(self.imh, self.imw),framerate=10)
         self.mouse_listener = MouseListener(on_move=self.on_move, on_click=self.on_click)
 
         self.calibration_markers = [(0, 0), (0, self.imw//2), (0, self.imw),
-                                    (self.imh//2, 0), (self.imh//2, self.imw//2), (self.imh//2, self:imw),
-                                    (self.imh, self.imw//2), (self.imh, self.imw//2), (self.imh, self.imw)]
+                                    (self.imh//2, 0), (self.imh//2, self.imw//2), (self.imh//2, self.imw),
+                                    (self.imh, 0), (self.imh, self.imw//2), (self.imh, self.imw)]
 
-        self.calibration_points =  [(), (), (),
-                                    (), (), ()
-                                    (), (), ()]
+        self.calibration_points = [(), (), (),
+                                   (), (), (),
+                                   (), (), ()]
 
-        self.conversion_table = None
-
-    def aim_at(y, x):
-        self.tilt_position = y
-        self.pan_position = x
-        self.tilt.set_servo_pulsewidth(self.tilt_pin, self.tilt_position)
-        self.pan.set_servo_pulsewidth(self.pan_pin, self.pan_position)
+        self.conversion_matrix = None
+        self.new_position = False
+        
+    def start(self):
+        Thread(target=self.update_positions, args=()).start()
+        return self
+    
+    def update_positions(self):
+        while True:
+            if self.new_position:
+                self.tilt.set_servo_pulsewidth(self.tilt_pin, self.tilt_position)
+                self.pan.set_servo_pulsewidth(self.pan_pin, self.pan_position)
+                self.new_position = False            
+    
+    def aim_at(self, y, x, coordinate_system='image'):
+        if coordinate_system == 'image':
+            self.tilt_position = self.conversion_matrix[0, y, x]
+            self.pan_position = self.conversion_matrix[1, y, x]
+        else:
+            self.tilt_position = y
+            self.pan_position = x
+            
+        self.new_position = True
+    
 
     def calibrate(self):
         self.calibrated = False
@@ -127,14 +190,15 @@ class PanTilt(object):
             # Grab frame from video stream
             frame = self.video_stream.read()
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            cal_point_coordinates = (int(self.calibration_markers[self.cal_point_idx][0]),
-                                     int(self.calibration_markers[self.cal_point_idx][1]))
+            cal_point_coordinates = (int(self.calibration_markers[self.cal_point_idx][1]),
+                                     int(self.calibration_markers[self.cal_point_idx][0]))
             cv2.circle(frame, cal_point_coordinates, 15, (0, 0, 255), 2)
             cv2.imshow('Object detector', frame)
 
         print('\nCalibration finished!\n')
         self.mouse_listener.stop()
         self.video_stream.stop()
+        cv2.destroyAllWindows()
 
         print('The following points are calibrated:')
         for cal_point in self.calibration_points:
@@ -162,8 +226,7 @@ class PanTilt(object):
                 print(f'Saving calibration idx [{self.cal_point_idx}] to ({self.pan_position, self.tilt_position})')
                 self.pump.write(self.pump_pin, 0)
 
-                self.calibration_points[self.cal_point_idx][0] = self.tilt_position
-                self.calibration_points[self.cal_point_idx][1] = self.pan_position
+                self.calibration_points[self.cal_point_idx] = (self.tilt_position, self.pan_position)
 
                 if self.cal_point_idx < len(self.calibration_points)-1:
                     self.cal_point_idx += 1
@@ -178,9 +241,38 @@ pump_pin = 16
 try:
     pan_tilt = PanTilt(servo_pan_pin, servo_tilt_pin, pump_pin)
     pan_tilt.calibrate()
+    
+    pan_tilt.video_stream.start()
+    pan_tilt.start()
+    
+    markers = (random.randint(0, pan_tilt.imw-1), random.randint(0, pan_tilt.imh-1))
+    t = time.time()
+    gun = Gun(pump_pin)
+    gun.start()
+    
+    while(True):
+        
+        frame = pan_tilt.video_stream.read()
+        frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        cv2.circle(frame, markers, 15, (0, 0, 255), 2)
+        cv2.imshow('Object detector', frame)
+        
+        if cv2.waitKey(1) == ord('q'):
+            break
+        
+        if not gun.firing:
+            markers = (random.randint(0, pan_tilt.imw-1), random.randint(0, pan_tilt.imh-1))
+            pan_tilt.aim_at(markers[1], markers[0], coordinate_system='image')
+            gun.fire()
+
+            
+
+            
+        
+    
 
 except KeyboardInterrupt:
-    servo_y.set_PWM_dutycycle(servo_y_pin, 0)
-    servo_y.set_PWM_frequency(servo_y_pin, 0)
-    servo_x.set_PWM_dutycycle(servo_x_pin, 0)
-    servo_x.set_PWM_frequency(servo_x_pin, 0)
+    servo_y.set_PWM_dutycycle(servo_tilt_pin, 0)
+    servo_y.set_PWM_frequency(servo_tilt_pin, 0)
+    servo_x.set_PWM_dutycycle(servo_pan_pin, 0)
+    servo_x.set_PWM_frequency(servo_pan_pin, 0)
